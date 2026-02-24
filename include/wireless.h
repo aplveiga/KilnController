@@ -54,6 +54,7 @@ private:
     unsigned long lastNTPSync;
     int cachedNetworkCount;
     bool ntpSynced;
+    bool firmwareUploadSuccess;  // Track OTA upload state
     
     // Web server handlers
     void setupWebServer();
@@ -66,6 +67,22 @@ private:
     void handleClearData();
     void handleFirmwareUpload();
     void handleNotFound();
+    
+    // Program management handlers
+    void handleProgramList();
+    void handleProgramLoad();
+    void handleProgramSave();
+    void handleProgramDelete();
+    
+    // Button action handlers
+    void handleButtonStartStop();
+    void handleButtonCycleProgram();
+    
+    // PID tuning handlers
+    void handlePIDGet();
+    void handlePIDSet();
+    void handleSSRRateGet();
+    void handleSSRRateSet();
     
     // Configuration file operations
     const char* CONFIG_FILE = "/wifi_config.json";

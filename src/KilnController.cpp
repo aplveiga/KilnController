@@ -8,8 +8,10 @@
 #include <Adafruit_SSD1306.h>
 #include <max6675.h>
 #include <LittleFS.h>
+#include <PID_v1.h>
 #include <wireless.h>
 #include <kiln_data_logger.h>
+#include <program_manager.h>
 
 //
 // Pin mapping (NodeMCU style Dn defines available in ESP8266 core)
@@ -36,6 +38,12 @@ float Kp = 15.5;    // Proportional gain (lower for high thermal mass to minimiz
 float Ki = 13.1;   // Integral gain (moderate for steady-state accuracy)
 float Kd = 1.20;  // Derivative gain (higher to dampen oscillations and thermal lag)
 
+// PID objects and variables
+double pidSetpoint = 25.0;
+double pidInput = 25.0;
+double pidOutput = 0.0;
+PID kilnPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
+
 // Control window for SSR (ms)
 const unsigned long CONTROL_WINDOW_MS = 2000UL; // 2s window
 
@@ -55,50 +63,8 @@ unsigned long buttonPressStart = 0;
 bool buttonPrev = false;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
 
-// Program structures
-struct Segment {
-  float rate_c_per_hour; // °C/h
-  float target_c;        // target temperature for this segment
-  uint32_t hold_seconds; // hold duration in seconds
-};
-
-struct Program {
-  const char* name;
-  Segment segments[9]; // max 9 segments for simplicity
-  uint8_t seqCount;
-};
-
-// Default program "9-step" based on typical kiln firing curve (ramp rates and holds); adjust as needed
-Program defaultProgram = {
-  "9-step",
-  {
-    {50.0, 100.0, 30 * 60},   // seq 1
-    {200.0, 300.0, 0},  // seq 2
-    {75.0, 550.0, 30 * 60},   // seq 3
-    {25.0, 573.0, 30 * 60},  // seq 4
-    {50.0, 600.0, 0},   // seq 5
-    {100.0, 900.0, 0},  // seq 6
-    {50.0, 1000.0, 0},   // seq 7
-    {25.0, 1050.0, 0},  // seq 8
-    {25.0, 1100.0, 15 * 60}   // seq 9
-  },
-  9
-};
-
-// Secondary program "3-step" for faster testing; adjust as needed
-Program SecondaryProgram = {
-  "4-step",
-  {
-    {50.0, 100.0, 15 * 60},   // seq 1
-    {100.0, 573.0, 30 * 60},  // seq 2
-    {100.0, 900.0, 0},  // seq 3
-    {50.0, 1100.0, 30 * 60}   // seq 4  
-  },
-  4
-};
-
-// Runtime program state
-Program* currentProgram = &defaultProgram;
+// Runtime program state - loaded from flash
+Program currentProgram;
 bool programRunning = false;
 uint8_t currentSegmentIndex = 0;
 float segmentStartTemp = 25.0;     // captured at segment start
@@ -109,15 +75,6 @@ bool inHold = false;
 bool inPause = false;
 bool SSR_Status = false;
 
-
-// PID runtime
-float pidSetpoint = 25.0;
-float pidInput = 25.0;
-float pidOutput = 0.0;
-float integralTerm = 0.0;
-float lastError = 0.0;
-unsigned long lastPidMillis = 0;
-
 // Persistence (LittleFS)
 const char *STATE_FILE = "/kiln_state.txt";
 bool stateDirty = false;
@@ -127,6 +84,16 @@ float lastSavedSetpoint = 0.0;
 
 // SSR time-proportional control
 unsigned long windowStartMillis = 0;
+unsigned long lastSSRChangeTime = 0;          // Rate limiting: prevent SSR changes more than 1/sec
+unsigned long SSR_CHANGE_RATE_LIMIT = 1000UL; // Minimum 1000ms between state changes
+
+// Function to set SSR rate limiting from web interface
+void setSSRRateLimit(unsigned long rateMs) {
+  if (rateMs >= 100 && rateMs <= 10000) {  // 100ms to 10 seconds
+    SSR_CHANGE_RATE_LIMIT = rateMs;
+    Serial.printf("[Kiln] SSR rate limit updated to %lu ms\n", SSR_CHANGE_RATE_LIMIT);
+  }
+}
 
 // Thermocouple error flag
 bool sensorFault = false;
@@ -143,7 +110,7 @@ void saveState() {
   if (segmentStartMillis != 0) segmentElapsed = (now - segmentStartMillis) / 1000UL;
   if (inHold && holdStartMillis != 0) holdElapsed = (now - holdStartMillis) / 1000UL;
   f.printf("pidSetpoint=%.3f\n", pidSetpoint);
-  f.printf("programName=%s\n", currentProgram->name);
+  f.printf("programName=%s\n", currentProgram.name);
   f.printf("currentSegmentIndex=%u\n", currentSegmentIndex);
   f.printf("programRunning=%d\n", programRunning ? 1 : 0);
   f.printf("segmentElapsed=%lu\n", segmentElapsed);
@@ -185,11 +152,18 @@ void loadState() {
   }
   f.close();
 
-  // map program name to known programs (default and secondary)
+  // map program name to known programs - load from flash
   if (programName.length() > 0) {
-    if (programName == String(defaultProgram.name)) currentProgram = &defaultProgram;
-    else if (programName == String(SecondaryProgram.name)) currentProgram = &SecondaryProgram;
-    else currentProgram = &defaultProgram; // fallback
+    yield();
+    if (!programManager.loadProgram(programName.c_str(), currentProgram)) {
+      // Load failed, try 9-step fallback
+      Serial.println("[Kiln] Failed to load program, using 9-step");
+      yield();
+      if (!programManager.loadProgram("9-step", currentProgram)) {
+        strcpy(currentProgram.name, "UNKNOWN");
+        currentProgram.seqCount = 0;
+      }
+    }
   }
 
   // restore timing
@@ -199,6 +173,40 @@ void loadState() {
 
   lastSavedSetpoint = pidSetpoint;
   stateDirty = false;
+}
+
+void loadPIDValues() {
+  if (!LittleFS.exists("/pid.json")) {
+    Serial.println("[Kiln] No saved PID values, using defaults");
+    return;
+  }
+  
+  yield();
+  File file = LittleFS.open("/pid.json", "r");
+  if (!file) {
+    Serial.println("[Kiln] Failed to open PID file");
+    return;
+  }
+  
+  DynamicJsonDocument doc(256);
+  yield();
+  if (deserializeJson(doc, file) != DeserializationError::Ok) {
+    Serial.println("[Kiln] Failed to parse PID file");
+    file.close();
+    yield();
+    return;
+  }
+  
+  if (doc.containsKey("kp")) Kp = doc["kp"] | 15.5f;
+  if (doc.containsKey("ki")) Ki = doc["ki"] | 13.1f;
+  if (doc.containsKey("kd")) Kd = doc["kd"] | 1.20f;
+  
+  file.close();
+  yield();
+  Serial.printf("[Kiln] Loaded PID: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", Kp, Ki, Kd);
+  
+  // Update PID controller with loaded tuning parameters
+  // (This will be called again in setup() after PID object creation, so it's safe)
 }
 
 //
@@ -271,15 +279,15 @@ void drawUI() {
   display.printf("SP:%4.0fC", pidSetpoint);
   display.setTextSize(1);
   display.setCursor(70, 36);
-  display.print(currentProgram->name);
+  display.print(currentProgram.name);
 
   // Segment info and mode
   display.setCursor(0, 48);
   if (sensorFault) {
     display.print("Sensor Fault");
   } else if (programRunning) {
-    Segment &seg = currentProgram->segments[currentSegmentIndex];
-    display.printf("Rph:%0.0f %u/%u %s", currentProgram->segments[currentSegmentIndex].rate_c_per_hour, currentSegmentIndex+1, currentProgram->seqCount, inPause ? "PAUSE" : inHold ? "HOLD" : "RAMP");
+    Segment &seg = currentProgram.segments[currentSegmentIndex];
+    display.printf("Rph:%0.0f %u/%u %s", currentProgram.segments[currentSegmentIndex].rate_c_per_hour, currentSegmentIndex+1, currentProgram.seqCount, inPause ? "PAUSE" : inHold ? "HOLD" : "RAMP");
     // if in hold, show remaining time
     if (inHold) {
       unsigned long holdElapsed = (now - holdStartMillis) / 1000UL;
@@ -301,37 +309,105 @@ void drawUI() {
 }
 
 //
-// PID compute (simple discrete PID with anti-windup)
+// PID compute using Arduino-PID-Library (robust, derivative kick filtered, anti-windup)
 void pidCompute(unsigned long nowMs) {
-  float dt = (nowMs - lastPidMillis) / 1000.0;
-  if (dt <= 0) return;
-  float error = pidSetpoint - pidInput;
-  integralTerm += Ki * error * dt;
-  // anti-windup clamp integral
-  if (integralTerm > 100.0) integralTerm = 100.0;
-  if (integralTerm < 0.0) integralTerm = 0.0;
-  float derivative = (error - lastError) / dt;
-  pidOutput = Kp * error + integralTerm + Kd * derivative;
-  // clamp output to 0..100%
-  if (pidOutput > 100.0) pidOutput = 100.0;
-  if (pidOutput < 0.0) pidOutput = 0.0;
-  lastError = error;
-  lastPidMillis = nowMs;
+  // Update PID at 1000ms intervals (1Hz sample rate)
+  kilnPID.Compute();
+}
+
+// Forward declarations for program control functions
+void startProgram(Program* p);
+void pauseProgram();
+void stopProgram();
+
+//
+// Button Action Functions (called from physical button or dashboard)
+//
+void buttonActionStartStop() {
+  if (programRunning) {
+    pauseProgram();
+    Serial.println("[Kiln] Button: PAUSE");
+  } else {
+    Serial.printf("[Kiln] Button: START (calling startProgram with '%s')\n", currentProgram.name);
+    startProgram(&currentProgram);
+  }
+  // Update display immediately
+  drawUI();
+}
+
+void buttonActionCycleProgram() {
+  bool wasRunning = programRunning;
+  if (wasRunning) stopProgram();
+
+  // Get list of all available programs
+  Dir dir = LittleFS.openDir("/programs");
+  String programs[20];  // Support up to 20 programs
+  int programCount = 0;
+  int currentIndex = -1;
+  
+  // Enumerate all programs
+  while (dir.next() && programCount < 20) {
+    String filename = dir.fileName();
+    if (filename.endsWith(".json")) {
+      String programName = filename.substring(0, filename.length() - 5);
+      programs[programCount] = programName;
+      
+      // Find current program index
+      if (programName == currentProgram.name) {
+        currentIndex = programCount;
+      }
+      programCount++;
+    }
+    yield();
+  }
+  
+  // If we have programs, cycle to the next one
+  if (programCount > 0) {
+    int nextIndex = (currentIndex + 1) % programCount;  // Wrap around at end
+    
+    yield();
+    if (programManager.loadProgram(programs[nextIndex].c_str(), currentProgram)) {
+      programManager.setLastSelectedProgram(programs[nextIndex].c_str());
+      Serial.printf("[Kiln] Button action: Cycled to program '%s'\n", programs[nextIndex].c_str());
+      // Update display immediately
+      drawUI();
+    }
+  } else {
+    Serial.println("[Kiln] No programs available to cycle");
+  }
+  
+  yield();
 }
 
 //
 // Program control functions
 //
 void startProgram(Program* p) {
-  currentProgram = p;
+  // Copy program data from pointer
+  if (p == nullptr) {
+    Serial.println("[Kiln] Error: Program pointer is null");
+    return;
+  }
+  
+  // Verify program has segments
+  if (p->seqCount == 0) {
+    Serial.printf("[Kiln] Error: Program '%s' has no segments\n", p->name);
+    return;
+  }
+  
+  currentProgram = *p;  // Copy struct data
   programRunning = true;
   currentSegmentIndex = 0;
-  segmentStartTemp = isnan(pidInput) ? pidSetpoint : pidInput; // begin ramp from measured temp
+  segmentStartTemp = isnan(pidInput) ? pidSetpoint : pidInput;
   segmentStartMillis = millis();
+  windowStartMillis = millis();  // Reset window for fresh SSR control
   inHold = false;
-  // initialize setpoint to current temp to begin ramp calculation
   inPause = false;
   stateDirty = true;
+  
+  // Debug output
+  Serial.printf("[Kiln] Program STARTED: %s (%d segments), setpoint=%.1f\n", 
+    currentProgram.name, currentProgram.seqCount, pidSetpoint);
   
   // Log program start
   logger.onProgramStart();
@@ -340,8 +416,13 @@ void startProgram(Program* p) {
 void stopProgram() {
   programRunning = false;
   inHold = false;
+  inPause = false;
   stateDirty = true;
   pidSetpoint = 25.0; // reset setpoint to ambient (or could hold last temp)
+  windowStartMillis = millis();  // Reset window for next program
+  lastSSRChangeTime = millis();  // Reset rate limiting timer
+  
+  Serial.println("[Kiln] Program STOPPED");
   
   // Log program stop
   logger.onProgramStop();
@@ -363,7 +444,7 @@ void pauseProgram() {
 }
 
 void advanceToNextSegment() {
-  if (currentSegmentIndex + 1 < currentProgram->seqCount) {
+  if (currentSegmentIndex + 1 < currentProgram.seqCount) {
     currentSegmentIndex++;
     segmentStartMillis = millis();
     segmentStartTemp = pidSetpoint; // start from last setpoint
@@ -376,7 +457,7 @@ void advanceToNextSegment() {
 }
 
 float computeSetpointForCurrentSegment(unsigned long nowMs) {
-  Segment &seg = currentProgram->segments[currentSegmentIndex];
+  Segment &seg = currentProgram.segments[currentSegmentIndex];
   unsigned long elapsed = (nowMs - segmentStartMillis) / 1000UL; // seconds
   float rate_per_s = seg.rate_c_per_hour / 3600.0; // °C per second
   float sp = segmentStartTemp + rate_per_s * (float)elapsed;
@@ -403,7 +484,7 @@ float computeSetpointForCurrentSegment(unsigned long nowMs) {
 
 void handleProgramProgress(unsigned long nowMs) {
   if (!programRunning || inPause) return;
-  Segment &seg = currentProgram->segments[currentSegmentIndex];
+  Segment &seg = currentProgram.segments[currentSegmentIndex];
   if (!inHold) {
     pidSetpoint = computeSetpointForCurrentSegment(nowMs);
   } else {
@@ -424,32 +505,122 @@ void handleProgramProgress(unsigned long nowMs) {
 }
 
 //
-// SSR time-proportional control
+// SSR time-proportional control with rate limiting (max 1 change per second)
 //
 void updateSSR(unsigned long nowMs) {
   // safety: enforce emergency cutoff and sensor faults
   if (sensorFault || (!isnan(pidInput) && pidInput > ABSOLUTE_MAX_TEMP) ) {
-    digitalWrite(PIN_SSR, LOW);
+    if (SSR_Status) {  // Only change if currently ON
+      if (nowMs - lastSSRChangeTime >= SSR_CHANGE_RATE_LIMIT) {
+        digitalWrite(PIN_SSR, LOW);
+        SSR_Status = false;
+        lastSSRChangeTime = nowMs;
+      }
+    }
     return;
   }
   if (!programRunning) {
     // if not running, ensure SSR is off
-    digitalWrite(PIN_SSR, LOW);
-    SSR_Status = false;
+    if (SSR_Status) {  // Only change if currently ON
+      if (nowMs - lastSSRChangeTime >= SSR_CHANGE_RATE_LIMIT) {
+        digitalWrite(PIN_SSR, LOW);
+        SSR_Status = false;
+        lastSSRChangeTime = nowMs;
+      }
+    }
     return;
   }
+  
   // Manage window
   if (nowMs - windowStartMillis > CONTROL_WINDOW_MS) {
     windowStartMillis += CONTROL_WINDOW_MS;
   }
+  
+  // Calculate desired SSR state based on PID output
   unsigned long onTime = (unsigned long)( (pidOutput / 100.0) * (float)CONTROL_WINDOW_MS );
-  if (nowMs - windowStartMillis < onTime) {
-    digitalWrite(PIN_SSR, HIGH);
-    SSR_Status = true;
-  } else {
-    digitalWrite(PIN_SSR, LOW);
-    SSR_Status = false;
+  bool desiredState = (nowMs - windowStartMillis < onTime);
+  
+  // Apply rate limiting: only change state if 1 second has elapsed since last change
+  if (desiredState != SSR_Status) {
+    if (nowMs - lastSSRChangeTime >= SSR_CHANGE_RATE_LIMIT) {
+      // Enough time has passed, allow state change
+      if (desiredState) {
+        digitalWrite(PIN_SSR, HIGH);
+        SSR_Status = true;
+      } else {
+        digitalWrite(PIN_SSR, LOW);
+        SSR_Status = false;
+      }
+      lastSSRChangeTime = nowMs;
+    }
+    // else: desired state differs but rate limit hasn't elapsed, keep current state
   }
+}
+
+//
+// Program Management
+//
+void initializePrograms() {
+  // Create default programs if they don't exist
+  Program defaultProg;
+  
+  // 9-step program
+  strcpy(defaultProg.name, "9-step");
+  defaultProg.seqCount = 9;
+  defaultProg.segments[0] = {50.0, 100.0, 30 * 60};
+  defaultProg.segments[1] = {200.0, 300.0, 0};
+  defaultProg.segments[2] = {75.0, 550.0, 30 * 60};
+  defaultProg.segments[3] = {25.0, 573.0, 30 * 60};
+  defaultProg.segments[4] = {50.0, 600.0, 0};
+  defaultProg.segments[5] = {100.0, 900.0, 0};
+  defaultProg.segments[6] = {50.0, 1000.0, 0};
+  defaultProg.segments[7] = {25.0, 1050.0, 0};
+  defaultProg.segments[8] = {25.0, 1100.0, 15 * 60};
+  
+  // Save 9-step if it doesn't exist
+  yield();
+  if (!programManager.loadProgram("9-step", defaultProg)) {
+    yield();
+    programManager.saveProgram(defaultProg);
+    yield();
+    Serial.println("[Kiln] Created default 9-step program");
+  }
+  
+  yield();
+  // 4-step program
+  strcpy(defaultProg.name, "4-step");
+  defaultProg.seqCount = 4;
+  defaultProg.segments[0] = {50.0, 100.0, 15 * 60};
+  defaultProg.segments[1] = {100.0, 573.0, 30 * 60};
+  defaultProg.segments[2] = {100.0, 900.0, 0};
+  defaultProg.segments[3] = {50.0, 1100.0, 30 * 60};
+  
+  // Save 4-step if it doesn't exist
+  yield();
+  if (!programManager.loadProgram("4-step", defaultProg)) {
+    yield();
+    programManager.saveProgram(defaultProg);
+    yield();
+    Serial.println("[Kiln] Created default 4-step program");
+  }
+  
+  yield();
+  // Load last selected program
+  yield();
+  if (!programManager.loadLastSelectedProgram(currentProgram)) {
+    // If no last selected program is saved, load 9-step
+    yield();
+    if (programManager.loadProgram("9-step", currentProgram)) {
+      programManager.setLastSelectedProgram("9-step");
+      Serial.println("[Kiln] Loaded 9-step as last selected program");
+    } else {
+      Serial.println("[Kiln] ERROR: Failed to load any program!");
+      strcpy(currentProgram.name, "EMPTY");
+      currentProgram.seqCount = 0;
+    }
+  }
+  
+  Serial.printf("[Kiln] Loaded program: %s (%d segments)\n", currentProgram.name, currentProgram.seqCount);
 }
 
 //
@@ -471,7 +642,21 @@ void setup() {
 
   // load persisted state (if exists)
   LittleFS.begin();
+  yield();
   loadState();
+  yield();
+  loadPIDValues();  // Load saved PID parameters
+  yield();
+  
+  // Initialize PID controller
+  kilnPID.SetMode(AUTOMATIC);           // Enable PID
+  kilnPID.SetOutputLimits(0, 100);      // Output: 0-100% PWM duty cycle
+  kilnPID.SetSampleTime(1000);          // 1 second sampling interval
+  kilnPID.SetTunings(Kp, Ki, Kd);       // Apply loaded/default tuning parameters
+  
+  // Initialize program manager and load default program
+  initializePrograms();
+  yield();
 
   // Initialize data logger
   logger.begin();
@@ -479,7 +664,6 @@ void setup() {
   // Initialize WiFi and OTA
   wirelessManager.begin();
 
-  lastPidMillis = millis();
   windowStartMillis = millis();
 
   display.clearDisplay();
@@ -500,7 +684,7 @@ void loop() {
   // Handle WiFi and OTA
   wirelessManager.handleWiFi();
 
-  // Button handling (Long press = cycle program; short press = start/stop)
+  // Button handling (Long press > 2 seconds = cycle program; short press = start/stop)
   bool btn = getButtonStateDebounced();
   if (btn != buttonPrev) {
     if (btn) {
@@ -509,23 +693,12 @@ void loop() {
     } else {
       // released now
       unsigned long held = now - buttonPressStart;
-      if (held >= LONG_PRESS_MS) {
+      if (held > LONG_PRESS_MS) {
         // long press -> cycle program selection
-        bool wasRunning = programRunning;
-        if (wasRunning) stopProgram();
-
-        if (currentProgram == &defaultProgram) {
-          currentProgram = &SecondaryProgram;
-        } else {
-          currentProgram = &defaultProgram;
-        }
+        buttonActionCycleProgram();
       } else {
         // short press -> start/stop program
-        if (programRunning) {
-          pauseProgram();
-        } else {
-          startProgram(currentProgram);
-        }
+        buttonActionStartStop();
       }
     }
     buttonPrev = btn;
@@ -555,7 +728,7 @@ void loop() {
 
     // Serial logging
     Serial.printf("T=%.2f SP=%.2f Out=%.1f Prog=%s Seg=%u Fault=%d\n",
-                  isnan(pidInput)?0.0f:pidInput, pidSetpoint, pidOutput, currentProgram->name, currentSegmentIndex+1, sensorFault?1:0);
+                  isnan(pidInput)?0.0f:pidInput, pidSetpoint, pidOutput, currentProgram.name, currentSegmentIndex+1, sensorFault?1:0);
 
     // Data logging (per-second when program is running or when there's activity)
     if (programRunning || !sensorFault) {
@@ -578,14 +751,14 @@ void loop() {
         totalDuration = (now - segmentStartMillis) / 1000UL;
       }
       
-      Segment &seg = currentProgram->segments[currentSegmentIndex];
+      Segment &seg = currentProgram.segments[currentSegmentIndex];
       logger.logData(
         isnan(pidInput) ? 0.0 : pidInput,  // temperature
         pidSetpoint,                        // setpoint
         seg.rate_c_per_hour,               // rate
         seg.target_c,                      // target
         totalDuration,                     // duration
-        currentProgram->name,              // program
+        currentProgram.name,              // program
         status                             // status
       );
     }
@@ -610,12 +783,12 @@ String getKilnStatusJSON() {
   doc["setpoint"] = pidSetpoint;
   
   // Program info
-  doc["program"] = currentProgram->name;
+  doc["program"] = currentProgram.name;
   doc["segment"] = currentSegmentIndex + 1;
-  doc["segmentCount"] = currentProgram->seqCount;
+  doc["segmentCount"] = currentProgram.seqCount;
   
   // Current segment details
-  Segment &seg = currentProgram->segments[currentSegmentIndex];
+  Segment &seg = currentProgram.segments[currentSegmentIndex];
   doc["rate"] = seg.rate_c_per_hour;
   doc["target"] = seg.target_c;
   
