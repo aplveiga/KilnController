@@ -8,13 +8,11 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println();
-  VextON();
   delay(100);
 
   // Initialising the UI will init the display too.
   display.init();
   display.setFont(ArialMT_Plain_10);
-  display.size(2);
 
   // Set the resolution of the analog-to-digital converter (ADC) to 12 bits (0-4095):
   analogReadResolution(12);
@@ -41,8 +39,8 @@ void loop() {
   // Read the analog voltage in millivolts from pin 1:
   int analogVolts = analogReadMilliVolts(1);
 
-  float aValue = analogValue * 490 / 100
-  float aVolts = analogVolts * 490 / 100
+  float aValue = analogValue * 490 / 100;
+  float aVolts = analogVolts * 490 / 100;
   
   display.setTextAlignment(TEXT_ALIGN_RIGHT);
   display.printf("ADC analog value = %d\n", aValue);
