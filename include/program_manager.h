@@ -44,6 +44,7 @@ private:
     String getProgramPath(const char* name);
     bool ensureDirectoryExists();
     bool programExists(const char* name);
+    void createDefaultPrograms();
 };
 
 extern ProgramManager programManager;

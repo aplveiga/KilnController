@@ -4,6 +4,7 @@ ProgramManager programManager;
 
 ProgramManager::ProgramManager() {
     ensureDirectoryExists();
+    createDefaultPrograms();
 }
 
 bool ProgramManager::ensureDirectoryExists() {
@@ -32,6 +33,7 @@ bool ProgramManager::saveProgram(const Program& program) {
     String path = getProgramPath(program.name);
     
     // Create JSON document on heap to avoid stack overflow
+    // Need 1024 bytes for programs with up to 9 segments
     DynamicJsonDocument doc(1024);
     doc["name"] = program.name;
     doc["seqCount"] = program.seqCount;
@@ -84,6 +86,7 @@ bool ProgramManager::loadProgram(const char* name, Program& program) {
     }
     
     // Use DynamicJsonDocument on heap to avoid stack overflow
+    // Need 1024 bytes for programs with up to 9 segments
     DynamicJsonDocument doc(1024);
     yield();  // Feed watchdog before parsing
     
@@ -211,4 +214,93 @@ bool ProgramManager::setLastSelectedProgram(const char* name) {
 bool ProgramManager::loadLastSelectedProgram(Program& program) {
     const char* lastSelectedName = getLastSelectedProgram();
     return loadProgram(lastSelectedName, program);
+}
+
+void ProgramManager::createDefaultPrograms() {
+    // 4-Step Program
+    if (!programExists("4-step")) {
+        Program prog4;
+        strncpy(prog4.name, "4-step", sizeof(prog4.name) - 1);
+        prog4.name[sizeof(prog4.name) - 1] = '\0';
+        prog4.seqCount = 4;
+
+        // Segment 1: Ramp to 200°C at 50°C/h, hold 30 min
+        prog4.segments[0].rate_c_per_hour = 50.0;
+        prog4.segments[0].target_c = 200.0;
+        prog4.segments[0].hold_seconds = 1800;  // 30 minutes
+
+        // Segment 2: Ramp to 500°C at 100°C/h, hold 30 min
+        prog4.segments[1].rate_c_per_hour = 100.0;
+        prog4.segments[1].target_c = 500.0;
+        prog4.segments[1].hold_seconds = 1800;
+
+        // Segment 3: Ramp to 800°C at 50°C/h, hold 1 hour
+        prog4.segments[2].rate_c_per_hour = 50.0;
+        prog4.segments[2].target_c = 800.0;
+        prog4.segments[2].hold_seconds = 3600;
+
+        // Segment 4: Ramp to 1000°C at 20°C/h, hold 2 hours
+        prog4.segments[3].rate_c_per_hour = 20.0;
+        prog4.segments[3].target_c = 1000.0;
+        prog4.segments[3].hold_seconds = 7200;
+
+        saveProgram(prog4);
+        Serial.println("[ProgramMgr] Default program created: 4-step");
+    }
+
+    // 9-Step Program
+    if (!programExists("9-step")) {
+        Program prog9;
+        strncpy(prog9.name, "9-step", sizeof(prog9.name) - 1);
+        prog9.name[sizeof(prog9.name) - 1] = '\0';
+        prog9.seqCount = 9;
+
+        // Segment 1: Ramp to 150°C at 30°C/h, hold 15 min
+        prog9.segments[0].rate_c_per_hour = 30.0;
+        prog9.segments[0].target_c = 150.0;
+        prog9.segments[0].hold_seconds = 900;
+
+        // Segment 2: Ramp to 300°C at 50°C/h, hold 20 min
+        prog9.segments[1].rate_c_per_hour = 50.0;
+        prog9.segments[1].target_c = 300.0;
+        prog9.segments[1].hold_seconds = 1200;
+
+        // Segment 3: Ramp to 450°C at 75°C/h, hold 20 min
+        prog9.segments[2].rate_c_per_hour = 75.0;
+        prog9.segments[2].target_c = 450.0;
+        prog9.segments[2].hold_seconds = 1200;
+
+        // Segment 4: Ramp to 600°C at 100°C/h, hold 30 min
+        prog9.segments[3].rate_c_per_hour = 100.0;
+        prog9.segments[3].target_c = 600.0;
+        prog9.segments[3].hold_seconds = 1800;
+
+        // Segment 5: Ramp to 700°C at 75°C/h, hold 30 min
+        prog9.segments[4].rate_c_per_hour = 75.0;
+        prog9.segments[4].target_c = 700.0;
+        prog9.segments[4].hold_seconds = 1800;
+
+        // Segment 6: Ramp to 850°C at 50°C/h, hold 45 min
+        prog9.segments[5].rate_c_per_hour = 50.0;
+        prog9.segments[5].target_c = 850.0;
+        prog9.segments[5].hold_seconds = 2700;
+
+        // Segment 7: Ramp to 950°C at 30°C/h, hold 1 hour
+        prog9.segments[6].rate_c_per_hour = 30.0;
+        prog9.segments[6].target_c = 950.0;
+        prog9.segments[6].hold_seconds = 3600;
+
+        // Segment 8: Ramp to 1050°C at 20°C/h, hold 2 hours
+        prog9.segments[7].rate_c_per_hour = 20.0;
+        prog9.segments[7].target_c = 1050.0;
+        prog9.segments[7].hold_seconds = 7200;
+
+        // Segment 9: Cooldown at 10°C/h to 500°C, hold 30 min
+        prog9.segments[8].rate_c_per_hour = 10.0;
+        prog9.segments[8].target_c = 500.0;
+        prog9.segments[8].hold_seconds = 1800;
+
+        saveProgram(prog9);
+        Serial.println("[ProgramMgr] Default program created: 9-step");
+    }
 }

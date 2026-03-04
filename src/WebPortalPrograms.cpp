@@ -1,5 +1,15 @@
 // WebPortalPrograms.cpp
-// Handles kiln program management endpoints for web portal
+// [DEPRECATED] This file is superseded by WirelessManager class in webportal.cpp
+// Handler implementations have been moved to the WirelessManager class:
+// - handleProgramList() -> WirelessManager::handleProgramList()
+// - handleProgramLoad() -> WirelessManager::handleProgramLoad()
+// - handleProgramSave() -> WirelessManager::handleProgramSave()
+// - handleProgramDelete() -> WirelessManager::handleProgramDelete()
+//
+// This file is kept for compatibility but contains no active code.
+
+#if 0  // DEAD CODE - Disabled for cleanup
+
 #include "WebPortalPrograms.h"
 #include <ESP8266WebServer.h>
 #include <program_manager.h>
@@ -44,3 +54,5 @@ void handleProgramLoad() {
         server.send(404, "application/json", "{\"success\":false,\"error\":\"Program not found\"}");
     }
 }
+
+#endif  // End DEAD CODE

@@ -10,8 +10,8 @@
 #include <LittleFS.h>
 #include <PID_v1.h>
 #include <wireless.h>
-#include <kiln_data_logger.h>
 #include <program_manager.h>
+#include <data_logger.h>
 
 //
 // Pin mapping (NodeMCU style Dn defines available in ESP8266 core)
@@ -49,6 +49,7 @@ const unsigned long CONTROL_WINDOW_MS = 2000UL; // 2s window
 
 // Sampling / update intervals
 const unsigned long TEMP_INTERVAL_MS = 1000UL;  // temperature read, PID compute
+const unsigned long DATA_LOG_INTERVAL_MS = 60000UL; // data logging every 60 seconds
 
 // Safety limits
 const float ABSOLUTE_MAX_TEMP = 1200.0;   // emergency cutoff (°C)
@@ -59,6 +60,7 @@ const float SENSOR_MAX_VALID = 1100.0;
 const int ADC_BUTTON_THRESHOLD = 200;   // pressed if ADC < threshold (adjust hardware)
 const unsigned long LONG_PRESS_MS = 2000UL;
 unsigned long lastTempMillis = 0;
+unsigned long lastDataLogMillis = 0;  // Track last data log time
 unsigned long buttonPressStart = 0;
 bool buttonPrev = false;
 const unsigned long BUTTON_DEBOUNCE_MS = 50;
@@ -219,17 +221,26 @@ bool isButtonPressed() {
 
 bool getButtonStateDebounced() {
   static bool debouncedState = false;
-  static unsigned long lastChangeTime = 0;
+  static unsigned long changeDetectedTime = 0;
+  static bool inDebounceWait = false;
   
   bool currentState = isButtonPressed();
   
   if (currentState != debouncedState) {
-    if (millis() - lastChangeTime >= BUTTON_DEBOUNCE_MS) {
+    // State has changed - start debounce timer
+    if (!inDebounceWait) {
+      inDebounceWait = true;
+      changeDetectedTime = millis();
+    }
+    
+    // Wait for debounce period
+    if (millis() - changeDetectedTime >= BUTTON_DEBOUNCE_MS) {
       debouncedState = currentState;
-      lastChangeTime = millis();
+      inDebounceWait = false;
     }
   } else {
-    lastChangeTime = millis();
+    // State is stable - reset debounce wait
+    inDebounceWait = false;
   }
   
   return debouncedState;
@@ -343,39 +354,58 @@ void buttonActionCycleProgram() {
   Dir dir = LittleFS.openDir("/programs");
   String programs[20];  // Support up to 20 programs
   int programCount = 0;
-  int currentIndex = -1;
+  int currentIndex = 0;  // Default to first program
+  
+  Serial.println("[Kiln] === Cycling Programs ===");
+  Serial.printf("[Kiln] Current program: '%s'\n", currentProgram.name);
   
   // Enumerate all programs
   while (dir.next() && programCount < 20) {
     String filename = dir.fileName();
+    Serial.printf("[Kiln] Found file: '%s'\n", filename.c_str());
+    
     if (filename.endsWith(".json")) {
-      String programName = filename.substring(0, filename.length() - 5);
+      // Remove leading slash if present
+      int startPos = (filename[0] == '/') ? 1 : 0;
+      // Remove .json extension
+      String programName = filename.substring(startPos, filename.length() - 5);
       programs[programCount] = programName;
       
-      // Find current program index
-      if (programName == currentProgram.name) {
+      Serial.printf("[Kiln]   -> Program: '%s' (idx=%d)\n", programName.c_str(), programCount);
+      
+      // Find current program index (using strcmp for reliable comparison)
+      if (strcmp(programName.c_str(), currentProgram.name) == 0) {
         currentIndex = programCount;
+        Serial.printf("[Kiln]   -> MATCHED current program at index %d\n", currentIndex);
       }
       programCount++;
     }
     yield();
   }
   
+  Serial.printf("[Kiln] Total programs found: %d, current index: %d\n", programCount, currentIndex);
+  
   // If we have programs, cycle to the next one
   if (programCount > 0) {
     int nextIndex = (currentIndex + 1) % programCount;  // Wrap around at end
     
+    Serial.printf("[Kiln] Cycling: index %d -> %d\n", currentIndex, nextIndex);
+    Serial.printf("[Kiln] Next program name: '%s'\n", programs[nextIndex].c_str());
+    
     yield();
     if (programManager.loadProgram(programs[nextIndex].c_str(), currentProgram)) {
       programManager.setLastSelectedProgram(programs[nextIndex].c_str());
-      Serial.printf("[Kiln] Button action: Cycled to program '%s'\n", programs[nextIndex].c_str());
+      Serial.printf("[Kiln] ✓ Cycled to: '%s' (loaded and selected)\n", programs[nextIndex].c_str());
       // Update display immediately
       drawUI();
+    } else {
+      Serial.printf("[Kiln] ✗ ERROR: Failed to load program '%s'\n", programs[nextIndex].c_str());
     }
   } else {
-    Serial.println("[Kiln] No programs available to cycle");
+    Serial.println("[Kiln] ✗ No programs found in /programs directory");
   }
   
+  Serial.println("[Kiln] === Cycle Complete ===");
   yield();
 }
 
@@ -408,9 +438,6 @@ void startProgram(Program* p) {
   // Debug output
   Serial.printf("[Kiln] Program STARTED: %s (%d segments), setpoint=%.1f\n", 
     currentProgram.name, currentProgram.seqCount, pidSetpoint);
-  
-  // Log program start
-  logger.onProgramStart();
 }
 
 void stopProgram() {
@@ -423,9 +450,6 @@ void stopProgram() {
   lastSSRChangeTime = millis();  // Reset rate limiting timer
   
   Serial.println("[Kiln] Program STOPPED");
-  
-  // Log program stop
-  logger.onProgramStop();
 }
 
 void pauseProgram() {
@@ -536,8 +560,8 @@ void updateSSR(unsigned long nowMs) {
     windowStartMillis += CONTROL_WINDOW_MS;
   }
   
-  // Calculate desired SSR state based on PID output
-  unsigned long onTime = (unsigned long)( (pidOutput / 100.0) * (float)CONTROL_WINDOW_MS );
+  // Calculate desired SSR state based on PID output (using integer math for efficiency)
+  unsigned long onTime = (pidOutput * CONTROL_WINDOW_MS) / 100UL;
   bool desiredState = (nowMs - windowStartMillis < onTime);
   
   // Apply rate limiting: only change state if 1 second has elapsed since last change
@@ -627,6 +651,7 @@ void initializePrograms() {
 // Setup & Loop
 //
 void setup() {
+
   Serial.begin(115200);
   delay(100);
   pinMode(PIN_SSR, OUTPUT);
@@ -658,14 +683,6 @@ void setup() {
   initializePrograms();
   yield();
 
-  // Initialize data logger
-  logger.begin();
-
-  // Initialize WiFi and OTA
-  wirelessManager.begin();
-
-  windowStartMillis = millis();
-
   display.clearDisplay();
   display.setTextSize(2);
   display.setCursor(0,0);
@@ -674,6 +691,11 @@ void setup() {
   display.setTextSize(1);
   display.println("Kp: " + String(Kp) + "\nKi: " + String(Ki) + "\nKd: " + String(Kd));
   display.display();
+
+  // Initialize WiFi and OTA
+  wirelessManager.begin();
+
+  windowStartMillis = millis();
   delay(5000);
 }
 
@@ -690,14 +712,18 @@ void loop() {
     if (btn) {
       // pressed now
       buttonPressStart = now;
+      Serial.println("[Kiln] Button PRESSED");
     } else {
       // released now
       unsigned long held = now - buttonPressStart;
+      Serial.printf("[Kiln] Button released after %lu ms\n", held);
       if (held > LONG_PRESS_MS) {
         // long press -> cycle program selection
+        Serial.println("[Kiln] LONG PRESS detected -> Cycling program");
         buttonActionCycleProgram();
       } else {
         // short press -> start/stop program
+        Serial.println("[Kiln] SHORT PRESS detected -> Start/Stop");
         buttonActionStartStop();
       }
     }
@@ -730,45 +756,45 @@ void loop() {
     Serial.printf("T=%.2f SP=%.2f Out=%.1f Prog=%s Seg=%u Fault=%d\n",
                   isnan(pidInput)?0.0f:pidInput, pidSetpoint, pidOutput, currentProgram.name, currentSegmentIndex+1, sensorFault?1:0);
 
-    // Data logging (per-second when program is running or when there's activity)
-    if (programRunning || !sensorFault) {
-      const char* status;
-      if (sensorFault) {
-        status = "FAULT";
-      } else if (!programRunning) {
-        status = "IDLE";
-      } else if (inPause) {
-        status = "PAUSE";
-      } else if (inHold) {
-        status = "HOLD";
-      } else {
-        status = "RAMP";
-      }
-      
-      // Calculate total program duration
-      uint32_t totalDuration = 0;
-      if (programRunning && segmentStartMillis > 0) {
-        totalDuration = (now - segmentStartMillis) / 1000UL;
-      }
-      
-      Segment &seg = currentProgram.segments[currentSegmentIndex];
-      logger.logData(
-        isnan(pidInput) ? 0.0 : pidInput,  // temperature
-        pidSetpoint,                        // setpoint
-        seg.rate_c_per_hour,               // rate
-        seg.target_c,                      // target
-        totalDuration,                     // duration
-        currentProgram.name,              // program
-        status                             // status
-      );
-    }
-
     // mark dirty if setpoint changed significantly since last save
     if (fabs(pidSetpoint - lastSavedSetpoint) > 0.5f) stateDirty = true;
 
     // flush state to flash periodically if dirty
     if (stateDirty && (now - lastStateSaveMillis >= STATE_SAVE_INTERVAL_MS)) {
       saveState();
+    }
+
+    // Data logging every 60 seconds
+    if (now - lastDataLogMillis >= DATA_LOG_INTERVAL_MS) {
+      lastDataLogMillis = now;
+      
+      // Get current status string
+      const char* statusStr = "IDLE";
+      if (sensorFault) {
+        statusStr = "FAULT";
+      } else if (programRunning) {
+        if (inPause) {
+          statusStr = "PAUSE";
+        } else if (inHold) {
+          statusStr = "HOLD";
+        } else {
+          statusStr = "RAMP";
+        }
+      }
+      
+      // Log the entry with current kiln state
+      float target = (currentSegmentIndex < currentProgram.seqCount) 
+                      ? currentProgram.segments[currentSegmentIndex].target_c 
+                      : 0.0;
+      
+      dataLogger.logEntry(
+        time(nullptr),
+        isnan(pidInput) ? 0.0 : pidInput,
+        pidSetpoint,
+        target,
+        currentProgram.name,
+        statusStr
+      );
     }
   }
   delay(10); // small delay to avoid busy loop; adjust as needed

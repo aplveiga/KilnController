@@ -5,7 +5,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
-#include <ArduinoOTA.h>
+#include <ESP8266HTTPUpdateServer.h>
 #include <Updater.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -20,6 +20,12 @@ struct WiFiConfig {
 class WirelessManager {
 public:
     WirelessManager();
+    
+    // Server instance - public for WebPortal handlers
+    ESP8266WebServer server;
+    
+    // HTTP Update Server for OTA updates
+    ESP8266HTTPUpdateServer httpUpdater;
     
     // Initialization
     void begin();
@@ -48,13 +54,11 @@ public:
     
 private:
     WiFiConfig config;
-    ESP8266WebServer server;
     unsigned long lastConnectionAttempt;
     unsigned long lastScanTime;
     unsigned long lastNTPSync;
     int cachedNetworkCount;
     bool ntpSynced;
-    bool firmwareUploadSuccess;  // Track OTA upload state
     
     // Web server handlers
     void setupWebServer();
@@ -63,9 +67,6 @@ private:
     void handleConnect();
     void handleReset();
     void handleKilnStatus();
-    void handleDataLog();
-    void handleClearData();
-    void handleFirmwareUpload();
     void handleNotFound();
     
     // Program management handlers
@@ -83,6 +84,11 @@ private:
     void handlePIDSet();
     void handleSSRRateGet();
     void handleSSRRateSet();
+    
+    // Data logger handlers
+    void handleDataLoggerData();
+    void handleDataLoggerCSV();
+    void handleDataLoggerClear();
     
     // Configuration file operations
     const char* CONFIG_FILE = "/wifi_config.json";

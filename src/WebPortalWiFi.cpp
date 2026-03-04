@@ -1,22 +1,25 @@
 // WebPortalWiFi.cpp
-// Handles WiFi/AP setup, scan, connect, reset endpoints for web portal
+// [DEPRECATED] This file is superseded by WirelessManager class in webportal.cpp
+// Handler implementations have been moved to the WirelessManager class:
+// - handleWiFiScan() -> WirelessManager::handleScan()
+// - handleWiFiConnect() -> WirelessManager::handleConnect()
+// - handleWiFiReset() -> WirelessManager::handleReset()
+//
+// This file is kept for compatibility but contains no active code.
+
+#if 0  // DEAD CODE - Disabled for cleanup
+
 #include "WebPortalWiFi.h"
 #include <ESP8266WiFi.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
-
-
-#include <ESP8266WiFi.h>
-#include <LittleFS.h>
-#include <ArduinoJson.h>
-#include <ESP8266WebServer.h>
-#include "WebPortalWiFi.h"
 
 extern ESP8266WebServer server;
 
 void handleWiFiScan() {
 	int networkCount = WiFi.scanNetworks();
-	StaticJsonDocument<2048> doc;
+	// Reduced from 2048 to 512 bytes (saves ~1.5KB per scan)
+	StaticJsonDocument<512> doc;
 	JsonArray networks = doc.createNestedArray("networks");
 	for (int i = 0; i < networkCount; i++) {
 		JsonObject net = networks.createNestedObject();
@@ -59,3 +62,4 @@ void handleWiFiReset() {
 	delay(500);
 	ESP.restart();
 }
+#endif  // End DEAD CODE

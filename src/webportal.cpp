@@ -2,19 +2,20 @@
 // Features: WiFi connection, AP mode fallback, web configuration, OTA updates, flash storage
 
 #include <wireless.h>
-#include <kiln_data_logger.h>
 #include <program_manager.h>
+#include <data_logger.h>
 #include <time.h>
-
-// Forward declaration
-void setupOTA();
 
 // Global instance
 WirelessManager wirelessManager;
 
+// Global server instance - shared reference for WebPortal handlers
+// This provides access to the server from WebPortal component files
+ESP8266WebServer& server = wirelessManager.server;
+
 // Constructor
 WirelessManager::WirelessManager() 
-    : server(80), lastConnectionAttempt(0), lastScanTime(0), lastNTPSync(0), cachedNetworkCount(0), ntpSynced(false), firmwareUploadSuccess(false) {
+    : server(80), lastConnectionAttempt(0), lastScanTime(0), lastNTPSync(0), cachedNetworkCount(0), ntpSynced(false) {
     config.apMode = true;  // Start in AP mode by default
 }
 
@@ -53,14 +54,22 @@ void WirelessManager::begin() {
     
     // Setup web server
     setupWebServer();
+    
+    // Initialize mDNS for hostname support
+    MDNS.begin("kiln-controller");
+    
+    // Setup HTTP Update Server for web-based OTA
+    httpUpdater.setup(&server);
+    
+    // Add HTTP service to mDNS
+    MDNS.addService("http", "tcp", 80);
+    
     server.begin();
     
     Serial.println("[WiFi] Initialization complete");
     Serial.printf("[WiFi] AP SSID: %s\n", AP_SSID);
     Serial.println("[WiFi] Setup web server on http://192.168.4.1");
-    
-    // Setup OTA updates
-    setupOTA();
+    Serial.println("[OTA] HTTP Update Server available at http://kiln-controller.local/update or http://[IP]/update");
 }
 
 // ============================================================================
@@ -80,10 +89,14 @@ void WirelessManager::connectToKnownNetworks() {
     lastConnectionAttempt = millis();
     unsigned long connectionStart = millis();
     
-    // Wait for connection with timeout
+    // Non-blocking WiFi connection with periodic status checks
+    // Prevents system freeze during WiFi connection
     while (WiFi.status() != WL_CONNECTED && millis() - connectionStart < CONNECTION_TIMEOUT) {
-        delay(500);
-        Serial.print(".");
+        delay(100);  // Shorter delay for responsiveness
+        if ((millis() - connectionStart) % 500 == 0) {
+            Serial.print(".");  // Status indicator every 500ms
+            yield();  // Allow other tasks to run
+        }
     }
     Serial.println();
     
@@ -119,8 +132,8 @@ void WirelessManager::handleWiFi() {
     // Handle web server requests
     server.handleClient();
     
-    // Handle OTA updates
-    ArduinoOTA.handle();
+    // Update mDNS service for continuous hostname availability
+    MDNS.update();
     
     // Synchronize time with NTP when WiFi connected
     if (WiFi.status() == WL_CONNECTED) {
@@ -146,15 +159,14 @@ void WirelessManager::handleWiFi() {
     }
     
     // Periodically scan for networks and auto-connect to known network
-    if (millis() - lastScanTime > SCAN_INTERVAL) {
+    // Only scan if not already connected to a WiFi network
+    if (millis() - lastScanTime > SCAN_INTERVAL && WiFi.status() != WL_CONNECTED) {
         scanNetworks();
         
         // If we're in AP mode but have a saved network, check if it's available
         if (config.apMode && config.ssid.length() > 0 && WiFi.status() != WL_CONNECTED) {
-            bool foundKnownNetwork = false;
             for (int i = 0; i < cachedNetworkCount; i++) {
                 if (WiFi.SSID(i) == config.ssid) {
-                    foundKnownNetwork = true;
                     Serial.printf("[WiFi] Known network '%s' detected during periodic scan, attempting connection...\n", config.ssid.c_str());
                     connectToKnownNetworks();
                     break;
@@ -261,18 +273,22 @@ void WirelessManager::syncTimeWithNTP() {
     
     // Configure time with NTP server
     // timezone offset in seconds (0 = UTC), daylight savings offset in seconds
-    time_t now_sec = time(nullptr);
     
     // Use pool.ntp.org - multiple NTP servers worldwide
     // Format: configTime(timezone_offset, dst_offset, ntp_server1, ntp_server2, ntp_server3)
     configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
     
-    // Wait for time to be set (max 3 seconds)
+    // Non-blocking NTP sync with timeout protection
+    // Prevents system freeze and maintains temperature control loop responsiveness
     Serial.println("[NTP] Waiting for NTP time to be set...");
-    time_t timeout = time(nullptr) + 3;  // 3 second timeout
-    while (time(nullptr) < 24 * 3600 && time(nullptr) < timeout) {
-        delay(100);
-        yield();  // Allow ESP8266 to handle other tasks
+    time_t timeout = millis() + 3000;  // 3 second timeout (using millis for accuracy)
+    time_t currentTime = time(nullptr);
+    const time_t MAX_WAIT_THRESHOLD = 24 * 3600;  // If time > 1 day, NTP likely synced
+    
+    while (currentTime < MAX_WAIT_THRESHOLD && millis() < timeout) {
+        delay(50);  // Reduced delay for responsiveness
+        yield();    // Allow ESP8266 to handle other tasks
+        currentTime = time(nullptr);
     }
     
     time_t updated_time = time(nullptr);
@@ -311,28 +327,6 @@ void WirelessManager::setupWebServer() {
     });
     server.on("/api/kiln", [this]() { handleKilnStatus(); });
     
-    // Firmware upload with proper dual-lambda handler
-    // First lambda: Upload handler (processes file chunks)
-    // Second lambda: Response handler (sends response after upload completes)
-    server.on("/api/firmware", HTTP_POST, 
-        [this]() {
-            handleFirmwareUpload();
-        },
-        [this]() {
-            server.sendHeader("Connection", "close");
-            if (firmwareUploadSuccess && !Update.hasError()) {
-                server.send(200, "application/json", "{\"success\":true,\"message\":\"Firmware updated. Rebooting...\"}");
-                delay(500);
-                ESP.restart();
-            } else {
-                server.send(400, "application/json", "{\"success\":false,\"error\":\"Firmware upload failed\"}");
-            }
-        }
-    );
-    
-    server.on("/api/data", [this]() { handleDataLog(); });
-    server.on("/api/cleardata", [this]() { handleClearData(); });
-    
     // Program handlers
     server.on("/api/programs/list", [this]() { handleProgramList(); });
     server.on("/api/programs/load", [this]() { handleProgramLoad(); });
@@ -349,6 +343,18 @@ void WirelessManager::setupWebServer() {
     server.on("/api/button/startstop", [this]() { handleButtonStartStop(); });
     server.on("/api/button/cycleprogram", [this]() { handleButtonCycleProgram(); });
     
+    // Data logger handlers
+    server.on("/api/datalogger/data", [this]() { handleDataLoggerData(); });
+    server.on("/api/datalogger/csv", [this]() { handleDataLoggerCSV(); });
+    server.on("/api/datalogger/clear", [this]() { handleDataLoggerClear(); });
+    server.on("/api/datalogger/count", [this]() { 
+        StaticJsonDocument<64> doc;
+        doc["count"] = dataLogger.getEntryCount();
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    });
+    
     server.onNotFound([this]() { handleNotFound(); });
 }
 
@@ -356,7 +362,7 @@ void WirelessManager::handleRoot() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "text/html", "");
     
-    server.sendContent(
+    server.sendContent(F(
         "<!DOCTYPE html><html><head>"
         "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1.0'>"
         "<title>Kiln Controller</title>"
@@ -419,17 +425,16 @@ void WirelessManager::handleRoot() {
         "<div class='wrapper'>"
         "<ul class='menu'>"
         "<li><button class='menu-btn' onclick='switchTab(1)'>📊 Dashboard</button></li>"
+        "<li><button class='menu-btn' onclick='switchTab(2)'>📈 Data Logger</button></li>"
         "<li><button class='menu-btn' onclick='switchTab(4)'>⚙️ Programs</button></li>"
         "<li><button class='menu-btn' onclick='switchTab(5)'>🎛️ PID Tuning</button></li>"
-        "<li><button class='menu-btn' onclick='switchTab(3)'>📋 Data Logger</button></li>"
         "<li><button class='menu-btn' onclick='switchTab(0)'>📡 WiFi Setup</button></li>"
-        "<li><button class='menu-btn' onclick='switchTab(2)'>⬆️ Firmware</button></li>"
         "</ul>"
         "<div class='content'>"
-    );
+    ));
     
     // Dashboard Tab (Now first/active)
-    server.sendContent(
+    server.sendContent(F(
         "<div class='tab active' id='tab-1'><div class='tab-content'>"
         "<h3>Kiln Status</h3>"
         "<div class='dashboard-grid'>"
@@ -446,10 +451,32 @@ void WirelessManager::handleRoot() {
         "<button class='btn-info' onclick='buttonCycleProgram()' style='flex:1'>🔄 Cycle</button>"
         "</div>"
         "</div></div>"
-    );
+    ));
+    
+    // Data Logger Tab
+    server.sendContent(F(
+        "<div class='tab' id='tab-2'><div class='tab-content'>"
+        "<h3>Temperature Data Logger</h3>"
+        "<p style='color:#666;font-size:13px'>Logged data is saved every 60 seconds. Last 3000 entries are kept.</p>"
+        "<div class='status-grid'>"
+        "<div class='status-box'><div class='status-label'>Logged Entries</div><div class='status-value' id='logCount'>0</div></div>"
+        "<div class='status-box'><div class='status-label'>Storage Capacity</div><div class='status-value'>3000</div></div>"
+        "</div>"
+        "<h3>Actions</h3>"
+        "<div class='button-group'>"
+        "<button class='btn-primary' onclick='downloadCSV()' style='flex:1'>📥 Download CSV</button>"
+        "<button class='btn-danger' onclick='clearLogs()'>🗑️ Clear Logs</button>"
+        "<button class='btn-info' onclick='refreshLogCount()'>🔄 Refresh</button>"
+        "</div>"
+        "<div class='message' id='msg-logger'></div>"
+        "<h3>Preview</h3>"
+        "<div class='table-info'>Showing last 10 entries</div>"
+        "<div class='table-container'><table><thead><tr><th>Timestamp</th><th>Temp (°C)</th><th>SP (°C)</th><th>Target (°C)</th><th>Program</th><th>Status</th></tr></thead><tbody id='logTable'><tr><td colspan='6' style='text-align:center;color:#999'>Loading...</td></tr></tbody></table></div>"
+        "</div></div>"
+    ));
     
     // WiFi Setup Tab
-    server.sendContent(
+    server.sendContent(F(
         "<div class='tab' id='tab-0'><div class='tab-content'>"
         "<h3>WiFi Configuration</h3>"
         "<div class='status-grid'>"
@@ -471,62 +498,10 @@ void WirelessManager::handleRoot() {
         "</div>"
         "<div class='message' id='msg-wifi'></div>"
         "</div></div>"
-    );
+    ));
     
-    // Firmware Update Tab
-    server.sendContent(
-        "<div class='tab' id='tab-2'><div class='tab-content'>"
-        "<h3>Firmware Update</h3>"
-        "<p style='color:#666;font-size:13px'>Select a firmware file (.bin) to upload and update the device.</p>"
-        "<div class='form-group'><label>Select Firmware File:</label><input type='file' id='firmwareFile' accept='.bin' onchange='updateFilename()'></div>"
-        "<div id='fileInfo' style='color:#666;font-size:12px;margin:10px 0'></div>"
-        "<div class='spinner' id='spinner-fw'></div>"
-        "<div class='progress-bar' id='progressBar' style='display:none'><div class='progress-fill' id='progressFill' style='width:0%'></div></div>"
-        "<div style='margin-top:10px' id='progressText' style='display:none'></div>"
-        "<div class='button-group'>"
-        "<button class='btn-info' onclick='browseFile()'>Browse</button>"
-        "<button class='btn-primary' onclick='uploadFirmware()'>Upload & Update</button>"
-        "</div>"
-        "<div class='message' id='msg-fw'></div>"
-        "</div></div>"
-        
-        // Data Logger Tab
-        "<div class='tab' id='tab-3'><div class='tab-content'>"
-        "<h3>Data Logger</h3>"
-        "<p style='color:#666;font-size:13px'>View logged kiln operation data with filtering options.</p>"
-        "<div class='filter-row'>"
-        "<div class='filter-group'>"
-        "<label>Sequence (Run):</label>"
-        "<input type='number' id='filterSeq' placeholder='All' min='1'>"
-        "</div>"
-        "<div class='filter-group'>"
-        "<label>From Time:</label>"
-        "<input type='datetime-local' id='filterTimeFrom'>"
-        "</div>"
-        "<div class='filter-group'>"
-        "<label>To Time:</label>"
-        "<input type='datetime-local' id='filterTimeTo'>"
-        "</div>"
-        "<div class='button-group'>"
-        "<button class='btn-info' onclick='loadDataLog()'>Load Data</button>"
-        "<button class='btn-primary' onclick='refreshDataLog()'>Refresh</button>"
-        "<button class='btn-danger' onclick='clearDataLog()'>Clear All</button>"
-        "</div>"
-        "</div>"
-        "<div class='table-info' id='tableInfo'></div>"
-        "<div class='table-container'>"
-        "<table id='dataTable'>"
-        "<thead><tr>"
-        "<th>Seq</th><th>Time</th><th>Temp (°C)</th><th>SP (°C)</th><th>Rate</th><th>Target</th><th>Duration</th><th>Program</th><th>Status</th>"
-        "</tr></thead>"
-        "<tbody id='tableBody'></tbody>"
-        "</table>"
-        "</div>"
-        "<div class='spinner' id='spinner-log'></div>"
-        "<div class='message' id='msg-log'></div>"
-        "</div></div>"
-        
-        // Programs Manager Tab (tab-4)
+    // Programs Tab and remaining tabs
+    server.sendContent(F(
         "<div class='tab' id='tab-4'><div class='tab-content'>"
         "<h3>Kiln Programs</h3>"
         "<div class='form-group'><label>Available Programs:</label>"
@@ -541,8 +516,6 @@ void WirelessManager::handleRoot() {
         "<button class='btn-primary' onclick='createSegmentFields()'>Create New</button>"
         "<button class='btn-primary' onclick='saveProgram()'>Save</button>"
         "</div><div class='message' id='msg-prog'></div></div></div>"
-        
-        // PID Tuning Tab (tab-5)
         "<div class='tab' id='tab-5'><div class='tab-content'>"
         "<h3>PID Tuning</h3>"
         "<p style='color:#666;font-size:13px'>Adjust PID parameters (values saved to flash)</p>"
@@ -573,10 +546,10 @@ void WirelessManager::handleRoot() {
         "<button class='btn-primary' onclick='saveSSRRate()'>Save SSR Rate</button>"
         "</div><div class='message' id='msg-pid'></div></div></div>"
         "</div></div>"
-    );
+    ));
     
     // JavaScript
-    server.sendContent(
+    server.sendContent(F(
         "<script>"
         "function switchTab(n){"
         "document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));"
@@ -619,25 +592,6 @@ void WirelessManager::handleRoot() {
         "function resetConfiguration(){"
         "if(confirm('Reset all WiFi settings?')){fetch('/api/reset',{method:'POST'}).then(r=>r.json()).then(d=>{showMessage('msg-wifi','Resetting...','success');setTimeout(()=>location.reload(),2000);});}"
         "}"
-        "function updateFilename(){"
-        "const f=document.getElementById('firmwareFile');const info=document.getElementById('fileInfo');"
-        "if(f.files.length>0){const sz=f.files[0].size;const kb=Math.round(sz/1024);const mb=(sz/1048576).toFixed(2);"
-        "if(sz>4194304){info.textContent='File: '+f.files[0].name+' - WARNING: File too large ('+mb+'MB, max 4MB)';info.style.color='#ff6b6b';}"
-        "else{info.textContent='File: '+f.files[0].name+' ('+kb+'KB)';info.style.color='';}"
-        "}else{info.textContent='';info.style.color='';}}"
-        "function uploadFirmware(){"
-        "const f=document.getElementById('firmwareFile');const sz=f.files[0]?.size;"
-        "if(!f.files.length){showMessage('msg-fw','Select a firmware file first','error');return;}"
-        "if(sz>4194304){showMessage('msg-fw','Firmware file too large (max 4MB)','error');return;}"
-        "if(confirm('Upload firmware? Device will reboot after successful update.')){document.getElementById('spinner-fw').style.display='block';"
-        "const fd=new FormData();fd.append('firmware',f.files[0]);"
-        "fetch('/api/firmware',{method:'POST',body:fd,timeout:60000}).then(r=>r.json()).then(d=>{"
-        "document.getElementById('spinner-fw').style.display='none';"
-        "if(d.success){showMessage('msg-fw','✓ '+d.message,'success');setTimeout(()=>{location.reload();},3000);}"
-        "else{showMessage('msg-fw','✗ Upload failed: '+(d.error||'Unknown error'),'error');}"
-        "}).catch(e=>{document.getElementById('spinner-fw').style.display='none';"
-        "showMessage('msg-fw','✗ Upload error: '+e,'error');});}}"
-        "function browseFile(){document.getElementById('firmwareFile').click();}"
         "function reloadPrograms(){"
         "fetch('/api/programs/list').then(r=>r.json()).then(d=>{"
         "const pl=document.getElementById('programList');pl.innerHTML='';"
@@ -662,7 +616,7 @@ void WirelessManager::handleRoot() {
         "}"
         "function loadProgram(n){"
         "fetch('/api/programs/load?name='+encodeURIComponent(n)).then(r=>r.json()).then(d=>{"
-        "if(d.success){document.getElementById('numSegments').value=d.program.seqCount;createSegmentFields();d.program.segments.forEach((s,i)=>{if(i<d.program.seqCount){document.getElementById('rate'+i).value=s.rate_c_per_hour;document.getElementById('target'+i).value=s.target_c;document.getElementById('hold'+i).value=Math.round(s.hold_seconds/60);}});}});"
+        "if(d.success){document.getElementById('numSegments').value=d.program.seqCount;createSegmentFields();d.program.segments.forEach((s,i)=>{if(i<d.program.seqCount){document.getElementById('rate'+i).value=s.rate;document.getElementById('target'+i).value=s.target;document.getElementById('hold'+i).value=Math.round(s.hold/60);}});}});"
         "}"
         "function createSegmentFields(){"
         "const n=parseInt(document.getElementById('numSegments').value)||1;const c=document.getElementById('segmentsForm');c.innerHTML='';"
@@ -672,7 +626,7 @@ void WirelessManager::handleRoot() {
         "const name=document.getElementById('programName').value.trim();if(!name){showMessage('msg-prog','Enter name','error');return;}"
         "const cnt=parseInt(document.getElementById('numSegments').value)||0;if(cnt<1||cnt>9){showMessage('msg-prog','1-9 segments','error');return;}"
         "const seg=[];"
-        "for(let i=0;i<cnt;i++){seg.push({rate_c_per_hour:parseFloat(document.getElementById('rate'+i).value)||0,target_c:parseFloat(document.getElementById('target'+i).value)||0,hold_seconds:Math.round((parseFloat(document.getElementById('hold'+i).value)||0)*60)});}"
+        "for(let i=0;i<cnt;i++){seg.push({rate:parseFloat(document.getElementById('rate'+i).value)||0,target:parseFloat(document.getElementById('target'+i).value)||0,hold:Math.round((parseFloat(document.getElementById('hold'+i).value)||0)*60)});}"
         "const prog={name,seqCount:cnt,segments:seg};"
         "fetch('/api/programs/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(prog)}).then(r=>r.json()).then(d=>{"
         "if(d.success){showMessage('msg-prog','Saved!','success');reloadPrograms();document.getElementById('programName').value='';}});"
@@ -724,50 +678,48 @@ void WirelessManager::handleRoot() {
         "document.getElementById('dash-target').textContent=(d.target||0).toFixed(1)+' °C';"
         "});"
         "}"
-        "function loadDataLog(){"
-        "const seq=document.getElementById('filterSeq').value;"
-        "const tFrom=document.getElementById('filterTimeFrom').value;"
-        "const tTo=document.getElementById('filterTimeTo').value;"
-        "document.getElementById('spinner-log').style.display='block';"
-        "document.getElementById('msg-log').textContent='';"
-        "fetch('/api/data').then(r=>r.json()).then(d=>{"
-        "let rows=d.data||[];"
-        "if(seq&&seq.trim()!==''){rows=rows.filter(row=>row.seq==parseInt(seq));}"
-        "if(tFrom){const tFromMs=new Date(tFrom).getTime();rows=rows.filter(row=>row.ts*1000>=tFromMs);}"
-        "if(tTo){const tToMs=new Date(tTo).getTime()+86400000;rows=rows.filter(row=>row.ts*1000<=tToMs);}"
-        "const tb=document.getElementById('tableBody');tb.innerHTML='';"
-        "rows.forEach(row=>{"
-        "const dt=new Date(row.ts*1000);"
-        "const time=dt.toLocaleString('es-ES',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});"
-        "const tr=document.createElement('tr');"
-        "tr.innerHTML='<td>'+row.seq+'</td><td>'+time+'</td><td>'+(row.t||0).toFixed(1)+'</td><td>'+(row.sp||0).toFixed(1)+'</td><td>'+(row.r||0).toFixed(1)+'</td><td>'+(row.tgt||0).toFixed(1)+'</td><td>'+(row.dur||0)+'</td><td>'+row.prog+'</td><td>'+row.stat+'</td>';"
-        "tb.appendChild(tr);"
-        "});"
-        "document.getElementById('msg-log').textContent=rows.length+' entries displayed';"
-        "document.getElementById('spinner-log').style.display='none';"
-        "}).catch(e=>{document.getElementById('spinner-log').style.display='none';showMessage('msg-log','Error loading data: '+e,'error');});"
-        "}"
-        "function refreshDataLog(){"
-        "loadDataLog();"
-        "}"
-        "function clearDataLog(){"
-        "if(confirm('Delete all logged data? This cannot be undone.')){fetch('/api/cleardata',{method:'POST'}).then(r=>r.json()).then(d=>{"
-        "if(d.success){showMessage('msg-log','All data cleared','success');loadDataLog();}"
-        "else{showMessage('msg-log','Failed to clear data: '+(d.error||'Unknown'),'error');}"
-        "}).catch(e=>{showMessage('msg-log','Error: '+e,'error');});"
-        "}"
-        "}"
         "updateStatus();setInterval(updateStatus,5000);"
         "updateKilnStatus();setInterval(updateKilnStatus,1000);"
         "loadCurrentPIDValues();"
+        "refreshLogCount();"
+        "setInterval(refreshLogCount,5000);"
+        "function refreshLogCount(){"
+        "fetch('/api/datalogger/count').then(r=>r.json()).then(d=>{"
+        "document.getElementById('logCount').textContent=d.count;"
+        "loadLogPreview();"
+        "});"
+        "}"
+        "function loadLogPreview(){"
+        "fetch('/api/datalogger/data').then(r=>r.json()).then(d=>{"
+        "const t=document.getElementById('logTable');"
+        "t.innerHTML='';"
+        "if(!d.entries||d.entries.length===0){t.innerHTML='<tr><td colspan=\"6\" style=\"text-align:center;color:#999\">No data logged yet</td></tr>';return;}"
+        "const sorted=d.entries.slice().sort((a,b)=>a.sequence-b.sequence);"
+        "const start=Math.max(0,sorted.length-10);"
+        "for(let i=start;i<sorted.length;i++){const e=sorted[i];const row=t.insertRow();const dt=new Date(e.timestamp*1000).toLocaleString();row.insertCell(0).textContent=dt;row.insertCell(1).textContent=e.temperature.toFixed(1);row.insertCell(2).textContent=e.setpoint.toFixed(1);row.insertCell(3).textContent=e.target.toFixed(1);row.insertCell(4).textContent=e.program;row.insertCell(5).textContent=e.status;}"
+        "});"
+        "}"
+        "function downloadCSV(){"
+        "showMessage('msg-logger','Downloading...','success');"
+        "fetch('/api/datalogger/csv').then(r=>r.blob()).then(blob=>{"
+        "const url=window.URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='kiln_data.csv';document.body.appendChild(a);a.click();window.URL.revokeObjectURL(url);document.body.removeChild(a);showMessage('msg-logger','Downloaded!','success');"
+        "}).catch(e=>{showMessage('msg-logger','Download failed: '+e,'error');});"
+        "}"
+        "function clearLogs(){"
+        "if(!confirm('Delete all logged data? This cannot be undone.')){return;}"
+        "fetch('/api/datalogger/clear',{method:'POST'}).then(r=>r.json()).then(d=>{"
+        "showMessage('msg-logger','Logs cleared!','success');refreshLogCount();"
+        "}).catch(e=>{showMessage('msg-logger','Error: '+e,'error');});"
+        "}"
         "</script></body></html>"
-    );
+    ));
 }
 
 void WirelessManager::handleScan() {
     scanNetworks();
     
-    StaticJsonDocument<2048> doc;
+    // Reduced from 2048 to 512 bytes (saves ~1.5KB per scan)
+    StaticJsonDocument<512> doc;
     JsonArray networks = doc.createNestedArray("networks");
     bool foundKnownNetwork = false;
     String foundSSID = "";
@@ -847,80 +799,11 @@ void WirelessManager::handleReset() {
     ESP.restart();
 }
 
-void WirelessManager::handleFirmwareUpload() {
-    HTTPUpload& upload = server.upload();
-    
-    if (upload.status == UPLOAD_FILE_START) {
-        firmwareUploadSuccess = false;  // Reset flag at start
-        Serial.printf("[OTA] Firmware upload start: %s (size: %u bytes)\n", upload.filename.c_str(), upload.totalSize);
-        
-        // Start OTA update with unknown size (0 means auto-detect)
-        if (!Update.begin(0, U_FLASH)) {
-            Serial.println("[OTA] Update.begin() failed!");
-            Update.printError(Serial);
-            return;
-        }
-    }
-    else if (upload.status == UPLOAD_FILE_WRITE) {
-        // Write firmware chunks to flash
-        size_t written = Update.write(upload.buf, upload.currentSize);
-        if (written != upload.currentSize) {
-            Serial.printf("[OTA] Update.write() failed: wrote %u of %u bytes at offset %u\n", written, upload.currentSize, upload.totalSize);
-            Update.printError(Serial);
-            return;
-        }
-        
-        // Log progress every 50KB
-        if (upload.totalSize % 51200 == 0) {
-            Serial.printf("[OTA] Progress: %u bytes written\n", upload.totalSize);
-        }
-        yield();
-    }
-    else if (upload.status == UPLOAD_FILE_END) {
-        // Finalize the update
-        Serial.printf("[OTA] Upload complete, finalizing... (total: %u bytes)\n", upload.totalSize);
-        
-        if (Update.end(true)) {  // true = set size to current progress
-            Serial.printf("[OTA] Firmware upload successful: %u bytes\n", upload.totalSize);
-            firmwareUploadSuccess = true;
-        } else {
-            Serial.printf("[OTA] Update.end() failed!\n");
-            Update.printError(Serial);
-            firmwareUploadSuccess = false;
-        }
-    }
-    else if (upload.status == UPLOAD_FILE_ABORTED) {
-        Serial.println("[OTA] Upload aborted!");
-        Update.end(false);
-        firmwareUploadSuccess = false;
-    }
-}
-
 void WirelessManager::handleKilnStatus() {
     // Forward kiln status request to main application
     // This function is declared externally in KilnController.cpp
     extern String getKilnStatusJSON();
     String response = getKilnStatusJSON();
-    server.send(200, "application/json", response);
-}
-
-void WirelessManager::handleDataLog() {
-    // Export logger data as JSON
-    extern KilnDataLogger& logger;
-    String data;
-    logger.exportData(data);
-    server.send(200, "application/json", data);
-}
-
-void WirelessManager::handleClearData() {
-    // Clear all logged data
-    extern KilnDataLogger& logger;
-    logger.clearAll();
-    StaticJsonDocument<64> doc;
-    doc["success"] = true;
-    doc["message"] = "All data cleared";
-    String response;
-    serializeJson(doc, response);
     server.send(200, "application/json", response);
 }
 
@@ -944,34 +827,33 @@ void WirelessManager::handleProgramLoad() {
         return;
     }
     
-    String name = server.arg("name");
     extern ProgramManager programManager;
     Program program;
+    String name = server.arg("name");
     yield();
     
-    if (programManager.loadProgram(name.c_str(), program)) {
-        DynamicJsonDocument doc(1024);
-        doc["success"] = true;
-        JsonObject prog = doc.createNestedObject("program");
-        prog["name"] = program.name;
-        prog["seqCount"] = program.seqCount;
-        
-        JsonArray segments = prog.createNestedArray("segments");
-        for (int i = 0; i < program.seqCount; i++) {
-            JsonObject seg = segments.createNestedObject();
-            seg["rate_c_per_hour"] = program.segments[i].rate_c_per_hour;
-            seg["target_c"] = program.segments[i].target_c;
-            seg["hold_seconds"] = program.segments[i].hold_seconds;
-        }
-        
-        String response;
-        serializeJson(doc, response);
-        doc.clear();
-        yield();
-        server.send(200, "application/json", response);
-    } else {
+    if (!programManager.loadProgram(name.c_str(), program)) {
         server.send(404, "application/json", "{\"success\":false,\"error\":\"Program not found\"}");
+        return;
     }
+    
+    DynamicJsonDocument doc(512);
+    doc["success"] = true;
+    JsonObject prog = doc.createNestedObject("program");
+    prog["name"] = program.name;
+    prog["seqCount"] = program.seqCount;
+    
+    JsonArray segments = prog.createNestedArray("segments");
+    for (int i = 0; i < program.seqCount; i++) {
+        JsonObject seg = segments.createNestedObject();
+        seg["rate"] = program.segments[i].rate_c_per_hour;
+        seg["target"] = program.segments[i].target_c;
+        seg["hold"] = program.segments[i].hold_seconds;
+    }
+    
+    String response;
+    serializeJson(doc, response);
+    server.send(200, "application/json", response);
 }
 
 void WirelessManager::handleProgramSave() {
@@ -980,9 +862,9 @@ void WirelessManager::handleProgramSave() {
         return;
     }
     
-    String body = server.arg("plain");
-    DynamicJsonDocument doc(1024);
-    DeserializationError error = deserializeJson(doc, body);
+    extern ProgramManager programManager;
+    DynamicJsonDocument doc(512);
+    DeserializationError error = deserializeJson(doc, server.arg("plain"));
     
     if (error) {
         server.send(400, "application/json", "{\"success\":false,\"error\":\"Invalid JSON\"}");
@@ -1005,13 +887,12 @@ void WirelessManager::handleProgramSave() {
     JsonArray segments = doc["segments"];
     for (int i = 0; i < seqCount && i < 9; i++) {
         if (segments[i].is<JsonObject>()) {
-            program.segments[i].rate_c_per_hour = segments[i]["rate_c_per_hour"] | 0.0f;
-            program.segments[i].target_c = segments[i]["target_c"] | 0.0f;
-            program.segments[i].hold_seconds = segments[i]["hold_seconds"] | 0;
+            program.segments[i].rate_c_per_hour = segments[i]["rate"] | 0.0f;
+            program.segments[i].target_c = segments[i]["target"] | 0.0f;
+            program.segments[i].hold_seconds = segments[i]["hold"] | 0;
         }
     }
     
-    extern ProgramManager programManager;
     yield();
     
     if (programManager.saveProgram(program)) {
@@ -1019,9 +900,6 @@ void WirelessManager::handleProgramSave() {
     } else {
         server.send(500, "application/json", "{\"success\":false,\"error\":\"Failed to save program\"}");
     }
-    
-    doc.clear();
-    yield();
 }
 
 void WirelessManager::handleProgramDelete() {
@@ -1035,8 +913,8 @@ void WirelessManager::handleProgramDelete() {
         return;
     }
     
-    String name = server.arg("name");
     extern ProgramManager programManager;
+    String name = server.arg("name");
     yield();
     
     if (programManager.deleteProgram(name.c_str())) {
@@ -1044,7 +922,6 @@ void WirelessManager::handleProgramDelete() {
     } else {
         server.send(500, "application/json", "{\"success\":false,\"error\":\"Failed to delete program\"}");
     }
-    yield();
 }
 
 // ============================================================================
@@ -1077,9 +954,9 @@ void WirelessManager::handlePIDSet() {
     float ki = (float)server.arg("ki").toDouble();
     float kd = (float)server.arg("kd").toDouble();
     
-    // Validate ranges
+    // Validate ranges (0-40)
     if (kp < 0 || kp > 40 || ki < 0 || ki > 40 || kd < 0 || kd > 40) {
-        server.send(400, "application/json", "{\"success\":false,\"error\":\"Values out of range\"}");
+        server.send(400, "application/json", "{\"success\":false,\"error\":\"Values out of range\"}" );
         return;
     }
     
@@ -1088,22 +965,20 @@ void WirelessManager::handlePIDSet() {
     Kd = kd;
     
     // Save to flash
-    DynamicJsonDocument doc(256);
+    DynamicJsonDocument doc(128);
     doc["kp"] = Kp;
     doc["ki"] = Ki;
     doc["kd"] = Kd;
     
     File file = LittleFS.open("/pid.json", "w");
-    if (file) {
-        serializeJson(doc, file);
-        file.close();
-        doc.clear();
-        yield();
-        server.send(200, "application/json", "{\"success\":true,\"message\":\"PID values saved\"}");
-    } else {
-        doc.clear();
+    if (!file) {
         server.send(500, "application/json", "{\"success\":false,\"error\":\"Failed to save PID values\"}");
+        return;
     }
+    
+    serializeJson(doc, file);
+    file.close();
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"PID values saved\"}");
 }
 
 void WirelessManager::handleSSRRateGet() {
@@ -1137,10 +1012,10 @@ void WirelessManager::handleSSRRateSet() {
     
     setSSRRateLimit(rateMs);
     
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<128> doc;
     doc["success"] = true;
     doc["rateMs"] = SSR_CHANGE_RATE_LIMIT;
-    doc["message"] = "SSR rate limit updated";
+    doc["message"] = "SSR rate updated";
     
     String response;
     serializeJson(doc, response);
@@ -1159,7 +1034,6 @@ void WirelessManager::handleButtonStartStop() {
     
     extern void buttonActionStartStop();
     buttonActionStartStop();
-    
     server.send(200, "application/json", "{\"success\":true}");
 }
 
@@ -1171,7 +1045,6 @@ void WirelessManager::handleButtonCycleProgram() {
     
     extern void buttonActionCycleProgram();
     buttonActionCycleProgram();
-    
     server.send(200, "application/json", "{\"success\":true}");
 }
 
@@ -1209,45 +1082,78 @@ bool WirelessManager::isConnected() {
     return WiFi.status() == WL_CONNECTED;
 }
 
+// ============================================================================
+// Data Logger Handlers
+// ============================================================================
+
+void WirelessManager::handleDataLoggerData() {
+    // Return all logged data as JSON
+    DynamicJsonDocument doc(4096);  // Large enough for multiple entries
+    
+    if (dataLogger.getEntries(doc)) {
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    } else {
+        StaticJsonDocument<64> errorDoc;
+        errorDoc["error"] = "Failed to retrieve log data";
+        String response;
+        serializeJson(errorDoc, response);
+        server.send(500, "application/json", response);
+    }
+}
+
+void WirelessManager::handleDataLoggerCSV() {
+    // Return logged data as CSV file for download
+    String csvContent;
+    
+    if (dataLogger.exportToCSV(csvContent)) {
+        // Send with Content-Disposition header to trigger download
+        // Set unique filename with timestamp
+        String filename = "kiln_data_";
+        time_t now = time(nullptr);
+        struct tm* timeinfo = localtime(&now);
+        char dateStr[20];
+        strftime(dateStr, sizeof(dateStr), "%Y%m%d_%H%M%S", timeinfo);
+        filename += String(dateStr) + ".csv";
+        
+        server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        server.send(200, "text/csv", csvContent);
+    } else {
+        StaticJsonDocument<64> errorDoc;
+        errorDoc["error"] = "Failed to export CSV";
+        String response;
+        serializeJson(errorDoc, response);
+        server.send(500, "application/json", response);
+    }
+}
+
+void WirelessManager::handleDataLoggerClear() {
+    // Clear all logged data
+    if (dataLogger.clearLogs()) {
+        StaticJsonDocument<64> doc;
+        doc["status"] = "success";
+        doc["message"] = "All logs cleared";
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    } else {
+        StaticJsonDocument<64> errorDoc;
+        errorDoc["error"] = "Failed to clear logs";
+        String response;
+        serializeJson(errorDoc, response);
+        server.send(500, "application/json", response);
+    }
+}
+
 String WirelessManager::getAPSSID() {
     return String(AP_SSID);
 }
 
 // ============================================================================
-// OTA Firmware Update
+// OTA Updates
 // ============================================================================
+// HTTP Update Server is initialized in WirelessManager::begin() and handles all OTA 
+// functionality through the /update endpoint. No additional setup required.
+// Access at: http://[IP]:80/update or http://kiln-controller.local/update
 
-void setupOTA() {
-    ArduinoOTA.setHostname("kilncontroller");
-    
-    ArduinoOTA.onStart([]() {
-        String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-        Serial.println("[OTA] Start updating " + type);
-    });
-    
-    ArduinoOTA.onEnd([]() {
-        Serial.println("\n[OTA] Update complete!");
-    });
-    
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
-    });
-    
-    ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("[OTA] Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) {
-            Serial.println("Auth Failed");
-        } else if (error == OTA_BEGIN_ERROR) {
-            Serial.println("Begin Failed");
-        } else if (error == OTA_CONNECT_ERROR) {
-            Serial.println("Connect Failed");
-        } else if (error == OTA_RECEIVE_ERROR) {
-            Serial.println("Receive Failed");
-        } else if (error == OTA_END_ERROR) {
-            Serial.println("End Failed");
-        }
-    });
-    
-    ArduinoOTA.begin();
-    Serial.println("[OTA] OTA updates enabled");
-}
