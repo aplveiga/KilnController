@@ -58,7 +58,7 @@ const float SENSOR_MAX_VALID = 1100.0;
 
 // Button thresholds (ADC 0..1023)
 const int ADC_BUTTON_THRESHOLD = 200;   // pressed if ADC < threshold (adjust hardware)
-const unsigned long LONG_PRESS_MS = 2000UL;
+const unsigned long LONG_PRESS_MS = 1000UL;
 unsigned long lastTempMillis = 0;
 unsigned long lastDataLogMillis = 0;  // Track last data log time
 unsigned long buttonPressStart = 0;
@@ -283,14 +283,20 @@ void drawUI() {
   display.print(SSR_Status ? "SSR" : "   ");
   display.setCursor(100, 9);
   bool btn_pressed = getButtonStateDebounced();
+  bool isLongPress = false;
   if (btn_pressed) {
     unsigned long pressDuration = now - buttonPressStart;
     if (pressDuration > LONG_PRESS_MS) {
       // Inverted colors for long press (indicates cycling)
       display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+      isLongPress = true;
     }
   }
   display.print(btn_pressed ? "BTN" : "   ");
+  // Draw box around BTN when in long press
+  if (isLongPress) {
+    display.drawRect(99, 8, 29, 10, SSD1306_BLACK);
+  }
   // Restore normal colors
   display.setTextColor(SSD1306_WHITE);
 
