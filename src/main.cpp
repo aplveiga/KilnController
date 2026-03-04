@@ -282,7 +282,17 @@ void drawUI() {
   display.setCursor(100, 0);
   display.print(SSR_Status ? "SSR" : "   ");
   display.setCursor(100, 9);
-  display.print(getButtonStateDebounced() ? "BTN" : "   ");
+  bool btn_pressed = getButtonStateDebounced();
+  if (btn_pressed) {
+    unsigned long pressDuration = now - buttonPressStart;
+    if (pressDuration > LONG_PRESS_MS) {
+      // Inverted colors for long press (indicates cycling)
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    }
+  }
+  display.print(btn_pressed ? "BTN" : "   ");
+  // Restore normal colors
+  display.setTextColor(SSD1306_WHITE);
 
   // Setpoint and program name
   display.setTextSize(2);
