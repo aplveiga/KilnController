@@ -283,22 +283,14 @@ void drawUI() {
   display.print(SSR_Status ? "SSR" : "   ");
   display.setCursor(100, 9);
   bool btn_pressed = getButtonStateDebounced();
-  bool isLongPress = false;
+  display.print(btn_pressed ? "BTN" : "   ");
+  // Draw 2px underline for long press
   if (btn_pressed) {
     unsigned long pressDuration = now - buttonPressStart;
     if (pressDuration > LONG_PRESS_MS) {
-      // Inverted colors for long press (indicates cycling)
-      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-      isLongPress = true;
+      display.fillRect(98, 18, 30, 2, SSD1306_WHITE);
     }
   }
-  display.print(btn_pressed ? "BTN" : "   ");
-  // Draw box around BTN when in long press
-  if (isLongPress) {
-    display.drawRect(99, 8, 29, 10, SSD1306_BLACK);
-  }
-  // Restore normal colors
-  display.setTextColor(SSD1306_WHITE);
 
   // Setpoint and program name
   display.setTextSize(2);
