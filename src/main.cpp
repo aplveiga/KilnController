@@ -48,7 +48,7 @@ PID kilnPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
 const unsigned long CONTROL_WINDOW_MS = 10000UL; // 10s window
 
 // Sampling / update intervals
-const unsigned long TEMP_INTERVAL_MS = 1000UL;  // temperature read, PID compute
+const unsigned long TEMP_INTERVAL_MS = 333UL;  // temperature read, PID compute
 const unsigned long DATA_LOG_INTERVAL_MS = 60000UL; // data logging every 60 seconds
 
 // Safety limits
@@ -99,6 +99,28 @@ void setSSRRateLimit(unsigned long rateMs) {
 
 // Thermocouple error flag
 bool sensorFault = false;
+
+// Temperature moving average (last 3 reads)
+const int TEMP_BUFFER_SIZE = 3;
+float tempBuffer[TEMP_BUFFER_SIZE] = {25.0, 25.0, 25.0};
+int tempBufferIndex = 0;
+
+// Function to update temperature moving average
+float updateTemperatureMovingAverage(float newTemp) {
+  if (isnan(newTemp)) {
+    return NAN;
+  }
+  
+  tempBuffer[tempBufferIndex] = newTemp;
+  tempBufferIndex = (tempBufferIndex + 1) % TEMP_BUFFER_SIZE;
+  
+  // Calculate average of all values in buffer
+  float sum = 0.0;
+  for (int i = 0; i < TEMP_BUFFER_SIZE; i++) {
+    sum += tempBuffer[i];
+  }
+  return sum / TEMP_BUFFER_SIZE;
+}
 
 // ---------- Persistence helpers ----------
 void saveState() {
@@ -774,8 +796,11 @@ void loop() {
   if (now - lastTempMillis >= TEMP_INTERVAL_MS) {
     lastTempMillis = now;
     float t = readTemperatureC();
-    if (!isnan(t)) pidInput = t;
-    else pidInput = NAN;
+    if (!isnan(t)) {
+      pidInput = updateTemperatureMovingAverage(t);
+    } else {
+      pidInput = NAN;
+    }
 
     // program progression update
     handleProgramProgress(now);
