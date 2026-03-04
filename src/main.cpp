@@ -45,7 +45,7 @@ double pidOutput = 0.0;
 PID kilnPID(&pidInput, &pidOutput, &pidSetpoint, Kp, Ki, Kd, DIRECT);
 
 // Control window for SSR (ms)
-const unsigned long CONTROL_WINDOW_MS = 2000UL; // 2s window
+const unsigned long CONTROL_WINDOW_MS = 10000UL; // 10s window
 
 // Sampling / update intervals
 const unsigned long TEMP_INTERVAL_MS = 1000UL;  // temperature read, PID compute
@@ -86,8 +86,8 @@ float lastSavedSetpoint = 0.0;
 
 // SSR time-proportional control
 unsigned long windowStartMillis = 0;
-unsigned long lastSSRChangeTime = 0;          // Rate limiting: prevent SSR changes more than 1/sec
-unsigned long SSR_CHANGE_RATE_LIMIT = 1000UL; // Minimum 1000ms between state changes
+unsigned long lastSSRChangeTime = 0;
+unsigned long SSR_CHANGE_RATE_LIMIT = 100UL; // Minimum 100ms between state changes
 
 // Function to set SSR rate limiting from web interface
 void setSSRRateLimit(unsigned long rateMs) {
@@ -298,7 +298,7 @@ void drawUI() {
     display.print("Sensor Fault");
   } else if (programRunning) {
     Segment &seg = currentProgram.segments[currentSegmentIndex];
-    display.printf("Rph:%0.0f %u/%u %s", currentProgram.segments[currentSegmentIndex].rate_c_per_hour, currentSegmentIndex+1, currentProgram.seqCount, inPause ? "PAUSE" : inHold ? "HOLD" : "RAMP");
+    display.printf("R:%0.0f %u/%u %s", currentProgram.segments[currentSegmentIndex].rate_c_per_hour, currentSegmentIndex+1, currentProgram.seqCount, inPause ? "P" : inHold ? "H" : "R");
     // if in hold, show remaining time
     if (inHold) {
       unsigned long holdElapsed = (now - holdStartMillis) / 1000UL;
@@ -431,6 +431,7 @@ void startProgram(Program* p) {
   segmentStartTemp = isnan(pidInput) ? pidSetpoint : pidInput;
   segmentStartMillis = millis();
   windowStartMillis = millis();  // Reset window for fresh SSR control
+  lastSSRChangeTime = millis();  // Reset rate limiting timer - allow immediate SSR change on start
   inHold = false;
   inPause = false;
   stateDirty = true;
@@ -529,9 +530,12 @@ void handleProgramProgress(unsigned long nowMs) {
 }
 
 //
-// SSR time-proportional control with rate limiting (max 1 change per second)
+// SSR time-proportional control with rate limiting
 //
 void updateSSR(unsigned long nowMs) {
+  static unsigned long lastDebugLog = 0;
+  bool shouldLog = (nowMs - lastDebugLog > 5000);  // Log every 5 seconds
+  
   // safety: enforce emergency cutoff and sensor faults
   if (sensorFault || (!isnan(pidInput) && pidInput > ABSOLUTE_MAX_TEMP) ) {
     if (SSR_Status) {  // Only change if currently ON
@@ -539,6 +543,7 @@ void updateSSR(unsigned long nowMs) {
         digitalWrite(PIN_SSR, LOW);
         SSR_Status = false;
         lastSSRChangeTime = nowMs;
+        Serial.println("[SSR] OFF - Safety cutoff");
       }
     }
     return;
@@ -550,34 +555,58 @@ void updateSSR(unsigned long nowMs) {
         digitalWrite(PIN_SSR, LOW);
         SSR_Status = false;
         lastSSRChangeTime = nowMs;
+        Serial.println("[SSR] OFF - Program not running");
       }
+    }
+    if (shouldLog) {
+      Serial.println("[SSR] Program NOT running - SSR disabled");
+      lastDebugLog = nowMs;
     }
     return;
   }
   
-  // Manage window
-  if (nowMs - windowStartMillis > CONTROL_WINDOW_MS) {
-    windowStartMillis += CONTROL_WINDOW_MS;
+  // Manage window - ensure windowStartMillis is properly initialized  
+  if (windowStartMillis == 0) {
+    windowStartMillis = nowMs;
+  }
+  
+  // Only advance window if time has passed
+  unsigned long timeSinceWindowStart = nowMs - windowStartMillis;
+  if (timeSinceWindowStart >= CONTROL_WINDOW_MS) {
+    // Advance window by complete cycles only
+    unsigned long cyclesToAdvance = (timeSinceWindowStart / CONTROL_WINDOW_MS);
+    windowStartMillis += (cyclesToAdvance * CONTROL_WINDOW_MS);
+    timeSinceWindowStart = nowMs - windowStartMillis;
   }
   
   // Calculate desired SSR state based on PID output (using integer math for efficiency)
   unsigned long onTime = (pidOutput * CONTROL_WINDOW_MS) / 100UL;
-  bool desiredState = (nowMs - windowStartMillis < onTime);
+  bool desiredState = (timeSinceWindowStart < onTime);
   
-  // Apply rate limiting: only change state if 1 second has elapsed since last change
+  if (shouldLog) {
+    Serial.printf("[SSR] Program Running: PID=%.1f%% OnTime=%lums WindowPos=%lums Desired=%s Actual=%s\n", 
+                  pidOutput, onTime, timeSinceWindowStart, desiredState?"ON":"OFF", SSR_Status?"ON":"OFF");
+    lastDebugLog = nowMs;
+  }
+  
+  // Apply rate limiting: only change state if rate limit has elapsed since last change
   if (desiredState != SSR_Status) {
     if (nowMs - lastSSRChangeTime >= SSR_CHANGE_RATE_LIMIT) {
       // Enough time has passed, allow state change
       if (desiredState) {
         digitalWrite(PIN_SSR, HIGH);
         SSR_Status = true;
+        Serial.println("[SSR] ON");
       } else {
         digitalWrite(PIN_SSR, LOW);
         SSR_Status = false;
+        Serial.println("[SSR] OFF");
       }
       lastSSRChangeTime = nowMs;
+    } else if (shouldLog) {
+      unsigned long remaining = SSR_CHANGE_RATE_LIMIT - (nowMs - lastSSRChangeTime);
+      Serial.printf("[SSR] Rate limited - waiting %lums\n", remaining);
     }
-    // else: desired state differs but rate limit hasn't elapsed, keep current state
   }
 }
 
@@ -730,6 +759,9 @@ void loop() {
     buttonPrev = btn;
   }
 
+  // Update SSR on every loop iteration for accurate rate limiting
+  updateSSR(now);
+
   // Temperature read + PID compute at interval
   if (now - lastTempMillis >= TEMP_INTERVAL_MS) {
     lastTempMillis = now;
@@ -745,9 +777,6 @@ void loop() {
 
     // safety: don't allow setpoint exceed absolute max
     if (pidSetpoint > ABSOLUTE_MAX_TEMP) pidSetpoint = ABSOLUTE_MAX_TEMP;
-
-    // Update SSR using time-proportional control
-    updateSSR(now);
 
     // UI update
     drawUI();
@@ -837,6 +866,25 @@ String getKilnStatusJSON() {
   doc["paused"] = inPause;
   doc["ssrStatus"] = SSR_Status;
   doc["pidOutput"] = pidOutput;
+  
+  // Diagnostic info - calculate window position using same logic as updateSSR
+  unsigned long now = millis();
+  unsigned long windowPos = 0;
+  if (windowStartMillis == 0) {
+    windowPos = 0;
+  } else {
+    unsigned long elapsed = now - windowStartMillis;
+    if (elapsed < CONTROL_WINDOW_MS) {
+      windowPos = elapsed;
+    } else {
+      windowPos = elapsed % CONTROL_WINDOW_MS;
+    }
+  }
+  
+  doc["windowPos"] = windowPos;
+  doc["windowSize"] = CONTROL_WINDOW_MS;
+  doc["ssrRateLimit"] = SSR_CHANGE_RATE_LIMIT;
+  doc["timeSinceSSRChange"] = (unsigned long)(now - lastSSRChangeTime);
   
   String response;
   serializeJson(doc, response);
