@@ -13,7 +13,7 @@ DataLogger::DataLogger() : cacheCount(0), cacheIndex(0), totalEntryCount(0), nex
         File file = LittleFS.open(LOG_INDEX_FILE, "r");
         if (file) {
             DynamicJsonDocument doc(256);
-            DeserializationError error = deserializeJson(doc, file);
+            deserializeJson(doc, file);
             file.close();
             
             int savedVersion = doc["version"] | 0;
@@ -82,7 +82,7 @@ bool DataLogger::logEntry(uint32_t timestamp, float temperature, float setpoint,
 bool DataLogger::getEntries(DynamicJsonDocument& doc) {
     // Read entries from flash and create JSON
     if (!LittleFS.exists(LOG_FILE)) {
-        JsonArray entries_array = doc.createNestedArray("entries");
+        doc.createNestedArray("entries");
         doc["count"] = 0;
         doc["max"] = (int)MAX_LOG_ENTRIES;
         return true;
@@ -157,7 +157,7 @@ bool DataLogger::exportToCSV(String& csvContent) {
     file.close();
     yield();
     
-    Serial.printf("[DataLogger] CSV export: %lu entries, %u bytes\n", lineCount, csvContent.length());
+    Serial.printf("[DataLogger] CSV export: %u entries, %u bytes\n", lineCount, csvContent.length());
     return true;
 }
 
